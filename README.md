@@ -1,4 +1,59 @@
-# Pipeline d'Extraction des Données IPC (HCP Maroc)
+# Pipeline IPC/HCP — Données 2010-2025
+
+Pipeline automatisé pour collecter, télécharger et extraire les données de l'Indice des Prix à la Consommation (IPC) depuis le site du Haut Commissariat au Plan (HCP) du Maroc.
+
+---
+
+## Lancement en une seule commande
+
+```bash
+python3 pipeline.py                  # Lance toutes les étapes (saute celles déjà faites)
+python3 pipeline.py --step 2 3 4     # Lance uniquement les étapes 2, 3 et 4
+python3 pipeline.py --force          # Reforce toutes les étapes
+```
+
+---
+
+## Architecture
+
+```
+data-ext/
+├── pipeline.py          # 🚀 Point d'entrée unique
+├── src/
+│   ├── scraper.py       # Étape 1 : Scraping des URLs (Google Custom Search)
+│   ├── extractor.py     # Étape 2 : Extraction des liens PDF/DOCX
+│   ├── downloader.py    # Étape 3 : Téléchargement des fichiers
+│   └── parser.py        # Étape 4 : Extraction des tableaux
+├── downloads/           # Fichiers téléchargés (ignoré par git)
+├── extracted_tables/    # Tableaux CSV extraits par année (ignoré par git)
+├── hcp_ipc_reports_2010_2025.csv   # URLs des 186 rapports mensuels
+└── hcp_ipc_pdfs.csv                # Liens directs vers les documents
+```
+
+---
+
+## Les 4 Étapes du Pipeline
+
+### Étape 1 — `HCPScraper`
+Navigue sur le site du HCP via l'API Google Custom Search et récupère les URLs des articles mensuels de l'IPC pour 2010-2025. **Idempotence** : ne re-scrape que les mois dont l'URL est `nan`.
+
+### Étape 2 — `PDFLinkExtractor`
+Ouvre chaque page d'article et extrait les liens directs vers les documents joints (`<div class="pj">`). **Idempotence** : ne traite que les pages pas encore dans `hcp_ipc_pdfs.csv`.
+
+### Étape 3 — `Downloader`
+Télécharge les documents en priorité en version française (sinon arabe). Détecte automatiquement le vrai format (PDF, DOCX, DOC, RTF) via les magic bytes pour corriger les extensions. **Idempotence** : ne télécharge que les fichiers absents dans `downloads/`.
+
+### Étape 4 — `TableParser`
+Extrait les tableaux de données depuis tous les formats de fichiers (PDF, DOCX, DOC, RTF). Convertit les anciens formats via LibreOffice. Organise les résultats par année dans `extracted_tables/`. **Idempotence** : ne traite que les fichiers sans CSV de sortie existant.
+
+---
+
+## Comportement en cas d'erreur
+
+- Si une étape échoue partiellement, **seule la partie manquante est rejouée** au prochain lancement.
+- Si une étape critique échoue complètement, le pipeline s'arrête et affiche un rapport.
+- Chaque lancement se termine par un **résumé visuel** de l'état de chaque étape.
+
 
 Ce dépôt contient l'ensemble des scripts permettant de récupérer, télécharger et extraire les données de l'Indice des Prix à la Consommation (IPC) depuis le site du Haut Commissariat au Plan (HCP) du Maroc, pour la période 2010-2025.
 
