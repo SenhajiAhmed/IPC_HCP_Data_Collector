@@ -79,7 +79,13 @@ class HCPScraper:
             return False
         return True
 
-    def _find_report_url(self, month: str, year: int) -> Optional[str]:
+    def _find_report_url(self, month: str, year: int) -> tuple[Optional[str], bool]:
+        """
+        Retourne (url, is_blocked).
+        - (url, False)  : URL trouvée
+        - (None, False) : Pas de résultat (donnée vraiment absente)
+        - (None, True)  : Bloqué par rate-limit (403 ou 429)
+        """
         mois_propre = month.replace("d'", "d ").split()[-1]
         mois_sans_accent = self._remove_accents(mois_propre).lower()
         query = f"Indice des prix à la consommation {mois_propre} {year}"
@@ -89,9 +95,9 @@ class HCPScraper:
             try:
                 init = self.session.get(f"https://cse.google.com/cse.js?cx={self.CX}", timeout=15)
 
-                # Détection du rate-limit sur la requête init
-                if init.status_code == 429:
-                    print(f"    ⏳ Rate-limit (init) — attente {self.RATE_LIMIT_WAIT}s (tentative {attempt}/{self.MAX_RETRIES})...")
+                # 403 ou 429 sur init → bloqué
+                if init.status_code in (403, 429):
+                    print(f"    ⏳ Bloqué HTTP {init.status_code} (init) — attente {self.RATE_LIMIT_WAIT}s (tentative {attempt}/{self.MAX_RETRIES})...")
                     time.sleep(self.RATE_LIMIT_WAIT)
                     continue
 
@@ -111,8 +117,9 @@ class HCPScraper:
                 )
                 resp = self.session.get(api_url, timeout=15)
 
-                if resp.status_code == 429:
-                    print(f"    ⏳ Rate-limit (API) — attente {self.RATE_LIMIT_WAIT}s (tentative {attempt}/{self.MAX_RETRIES})...")
+                # 403 ou 429 sur l'API → bloqué
+                if resp.status_code in (403, 429):
+                    print(f"    ⏳ Bloqué HTTP {resp.status_code} (API) — attente {self.RATE_LIMIT_WAIT}s (tentative {attempt}/{self.MAX_RETRIES})...")
                     time.sleep(self.RATE_LIMIT_WAIT)
                     continue
 
@@ -137,10 +144,10 @@ class HCPScraper:
                             and str(year) in text
                             and (mois_propre.lower() in text or mois_sans_accent in text)):
                         if self._is_valid_url(url):
-                            return url
+                            return url, False  # Trouvé, non bloqué
 
-                # Résultats traités sans match — inutile de retenter
-                return None
+                # Résultats traités sans match valide → donnée absente (pas un blocage)
+                return None, False
 
             except requests.exceptions.Timeout:
                 print(f"    ⏱️  Timeout réseau (tentative {attempt}/{self.MAX_RETRIES}).")
@@ -149,8 +156,9 @@ class HCPScraper:
                 print(f"    [!] Exception inattendue: {e} (tentative {attempt}/{self.MAX_RETRIES}).")
                 time.sleep(self.BASE_DELAY * attempt)
 
-        print(f"    ❌ Échec après {self.MAX_RETRIES} tentatives.")
-        return None
+        # Toutes les tentatives ont échoué avec 403/429 → bloqué
+        print(f"    ❌ Échec après {self.MAX_RETRIES} tentatives (blocage API).")
+        return None, True
 
     def run(self):
         """Lance le scraping, uniquement pour les entrées manquantes ou nan."""
@@ -167,15 +175,77 @@ class HCPScraper:
             return
 
         print(f"  🔄 {len(missing)} entrée(s) à (re)scraper...")
-        for year, month in missing:
-            print(f"  [*] Scraping {month} {year}...")
-            url = self._find_report_url(month, year)
+
+        # File d'attente pour les items bloqués à retenter après cooldown
+        retry_queue: list[tuple[int, str]] = []
+        consecutive_blocked = 0          # Compteur de nans consécutifs dus à un blocage
+        pending_blocked: list[tuple[int, str]] = []  # Buffer des items bloqués en cours
+
+        def _scrape_and_record(year, month, is_retry: bool = False):
+            """Scrape un item et met à jour data. Retourne (url, is_blocked)."""
+            prefix = "  [Retry]" if is_retry else "  [*]"
+            print(f"{prefix} Scraping {month} {year}...")
+            url, blocked = self._find_report_url(month, year)
             data[(year, month)] = url if url else "nan"
             if url:
                 print(f"    ✅ Trouvé : {url}")
+            elif blocked:
+                print(f"    🔒 Bloqué — nan provisoire.")
             else:
-                print(f"    ⚠️  Non trouvé, conservé comme 'nan'.")
-
-            # Sauvegarde après chaque mois → reprise possible après Ctrl+C
+                print(f"    ⚠️  Non trouvé (donnée absente sur le site).")
             self._save(data)
             time.sleep(self.BASE_DELAY)
+            return url, blocked
+
+        for year, month in missing:
+            url, blocked = _scrape_and_record(year, month)
+
+            if url is None and blocked:
+                consecutive_blocked += 1
+                pending_blocked.append((year, month))
+
+                if consecutive_blocked >= 2:
+                    # ────── COOLDOWN ──────
+                    print(f"\n  ⏸️  {consecutive_blocked} nan(s) consécutif(s) causés par un blocage.")
+                    print(f"  ⏳ Cooldown de 60s puis retry des {consecutive_blocked} item(s) bloqué(s)...\n")
+                    time.sleep(60)
+
+                    # Retry immédiat des items bloqués
+                    recovered = []
+                    for ry, rm in pending_blocked:
+                        r_url, r_blocked = _scrape_and_record(ry, rm, is_retry=True)
+                        if r_url:
+                            recovered.append((ry, rm))
+                        elif r_blocked:
+                            # Toujours bloqué → ajouter à la file pour retry final
+                            if (ry, rm) not in retry_queue:
+                                retry_queue.append((ry, rm))
+
+                    if recovered:
+                        print(f"  ✅ {len(recovered)} item(s) récupéré(s) après cooldown.")
+
+                    # Réinitialiser le buffer
+                    consecutive_blocked = 0
+                    pending_blocked.clear()
+
+            else:
+                # URL trouvée OU nan non-bloqué (donnée vraiment absente) → reset compteur
+                if pending_blocked:
+                    # Le nan isolé précédent n'était pas un blocage → on l'ignore (déjà sauvegardé)
+                    if consecutive_blocked == 1:
+                        print(f"  ℹ️  Nan isolé pour {pending_blocked[-1][1]} {pending_blocked[-1][0]} — ignoré (donnée absente).")
+                consecutive_blocked = 0
+                pending_blocked.clear()
+
+        # ── Retry final pour les items toujours bloqués ──
+        if retry_queue:
+            print(f"\n  🔁 Retry final de {len(retry_queue)} entrée(s) encore bloquées...")
+            time.sleep(60)  # Dernier cooldown avant retry final
+            for ry, rm in retry_queue:
+                if data.get((ry, rm)) != "nan":
+                    continue
+                _scrape_and_record(ry, rm, is_retry=True)
+
+        found = sum(1 for y in self.YEARS for m in self.MONTHS if data.get((y, m), "nan") != "nan")
+        print(f"\n  💾 Sauvegardé dans {self.output_csv} — {found}/192 URLs trouvées.")
+
