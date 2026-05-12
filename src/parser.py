@@ -2,6 +2,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 
 import pandas as pd
 import pdfplumber
@@ -16,6 +17,9 @@ class TableParser:
     Idempotence : Pour chaque fichier dans downloads/, vérifie si au moins
     un CSV correspondant existe dans extracted_tables/<année>/. Si oui, skip.
     """
+
+    LIBREOFFICE_TIMEOUT = 90   # Secondes max pour la conversion LibreOffice
+    EXTRACT_TIMEOUT = 60       # Secondes max pour l'extraction des tableaux d'un fichier
 
     def __init__(
         self,
@@ -102,30 +106,54 @@ class TableParser:
         return tables
 
     def _extract_docx(self, filepath: str) -> list[pd.DataFrame]:
-        tables = []
-        try:
-            doc = Document(filepath)
-            for table in doc.tables:
-                data = [[cell.text for cell in row.cells] for row in table.rows]
-                df = self._clean_df(pd.DataFrame(data))
-                if self._is_valid(df):
-                    tables.append(df)
-        except Exception as e:
-            print(f"    [!] Erreur DOCX: {e}")
-        return tables
+        """Extrait les tableaux d'un fichier .docx avec un timeout de sécurité."""
+        result = []
+        error = []
+
+        def _worker():
+            try:
+                doc = Document(filepath)
+                for table in doc.tables:
+                    try:
+                        data = [[cell.text for cell in row.cells] for row in table.rows]
+                        df = self._clean_df(pd.DataFrame(data))
+                        if self._is_valid(df):
+                            result.append(df)
+                    except Exception as e:
+                        error.append(f"Table skipped: {e}")
+            except Exception as e:
+                error.append(str(e))
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(timeout=self.EXTRACT_TIMEOUT)
+
+        if t.is_alive():
+            print(f"    ⚠️  Extraction DOCX timeout ({self.EXTRACT_TIMEOUT}s) — fichier ignoré.")
+            return []
+        if error:
+            print(f"    [!] Erreur DOCX: {error[0]}")
+        return result
 
     def _convert_and_extract(self, filepath: str) -> list[pd.DataFrame]:
+        """Convertit .doc/.rtf en .docx via LibreOffice (avec timeout) puis extrait."""
         tables = []
         with tempfile.TemporaryDirectory() as tmpdir:
             try:
                 subprocess.run(
                     ["libreoffice", "--headless", "--convert-to", "docx", "--outdir", tmpdir, filepath],
-                    check=True, capture_output=True,
+                    check=True,
+                    capture_output=True,
+                    timeout=self.LIBREOFFICE_TIMEOUT,
                 )
                 base = os.path.splitext(os.path.basename(filepath))[0]
                 converted = os.path.join(tmpdir, base + ".docx")
                 if os.path.exists(converted):
                     tables = self._extract_docx(converted)
+            except subprocess.TimeoutExpired:
+                print(f"    ⚠️  Timeout LibreOffice ({self.LIBREOFFICE_TIMEOUT}s) — {os.path.basename(filepath)} ignoré.")
+            except subprocess.CalledProcessError as e:
+                print(f"    [!] LibreOffice a échoué: {e.stderr.decode(errors='replace')[:200]}")
             except Exception as e:
                 print(f"    [!] Erreur conversion: {e}")
         return tables

@@ -23,6 +23,9 @@ class HCPScraper:
     ]
     YEARS = range(2010, 2026)
     CX = "04ef8a898c9384bec"
+    MAX_RETRIES = 4          # Nombre de tentatives max par mois
+    BASE_DELAY = 2           # Délai de base entre requêtes (secondes)
+    RATE_LIMIT_WAIT = 65     # Attente en cas de 429 (secondes)
 
     def __init__(self, output_csv: str = "hcp_ipc_reports_2010_2025.csv"):
         self.output_csv = output_csv
@@ -82,37 +85,71 @@ class HCPScraper:
         query = f"Indice des prix à la consommation {mois_propre} {year}"
         encoded = urllib.parse.quote_plus(query)
 
-        try:
-            init = self.session.get(f"https://cse.google.com/cse.js?cx={self.CX}", timeout=10)
-            token = re.search(r'"cse_token":\s*"([^"]+)"', init.text)
-            version = re.search(r'"cselibVersion":\s*"([^"]+)"', init.text)
-            if not token or not version:
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                init = self.session.get(f"https://cse.google.com/cse.js?cx={self.CX}", timeout=15)
+
+                # Détection du rate-limit sur la requête init
+                if init.status_code == 429:
+                    print(f"    ⏳ Rate-limit (init) — attente {self.RATE_LIMIT_WAIT}s (tentative {attempt}/{self.MAX_RETRIES})...")
+                    time.sleep(self.RATE_LIMIT_WAIT)
+                    continue
+
+                token = re.search(r'"cse_token":\s*"([^"]+)"', init.text)
+                version = re.search(r'"cselibVersion":\s*"([^"]+)"', init.text)
+                if not token or not version:
+                    print(f"    [!] Token CSE introuvable (tentative {attempt}/{self.MAX_RETRIES}).")
+                    time.sleep(self.BASE_DELAY * attempt)
+                    continue
+
+                rurl = urllib.parse.quote_plus(f"https://www.hcp.ma/plugin/?q={encoded}#gsc.tab=0&gsc.q={encoded}&gsc.page=1")
+                api_url = (
+                    f"https://cse.google.com/cse/element/v1?rsz=filtered_cse&num=10&hl=fr&source=gcsc"
+                    f"&cselibv={version.group(1)}&cx={self.CX}&q={encoded}&safe=off"
+                    f"&cse_tok={urllib.parse.quote_plus(token.group(1))}&callback=google.search.cse.api"
+                    f"&rurl={rurl}"
+                )
+                resp = self.session.get(api_url, timeout=15)
+
+                if resp.status_code == 429:
+                    print(f"    ⏳ Rate-limit (API) — attente {self.RATE_LIMIT_WAIT}s (tentative {attempt}/{self.MAX_RETRIES})...")
+                    time.sleep(self.RATE_LIMIT_WAIT)
+                    continue
+
+                if resp.status_code != 200:
+                    print(f"    [!] HTTP {resp.status_code} (tentative {attempt}/{self.MAX_RETRIES}).")
+                    time.sleep(self.BASE_DELAY * attempt)
+                    continue
+
+                match = re.search(r"google\.search\.cse\.api\((.*)\);?", resp.text, re.DOTALL)
+                if not match:
+                    print(f"    [!] Parsing JSONP échoué (tentative {attempt}/{self.MAX_RETRIES}).")
+                    time.sleep(self.BASE_DELAY * attempt)
+                    continue
+
+                results = json.loads(match.group(1)).get("results", [])
+                for r in results:
+                    text = (r.get("titleNoFormatting", "").lower() + " "
+                            + r.get("unescapedUrl", "").lower() + " "
+                            + r.get("contentNoFormatting", "").lower())
+                    url = r.get("unescapedUrl", "")
+                    if ("prix" in text and "consommation" in text
+                            and str(year) in text
+                            and (mois_propre.lower() in text or mois_sans_accent in text)):
+                        if self._is_valid_url(url):
+                            return url
+
+                # Résultats traités sans match — inutile de retenter
                 return None
 
-            rurl = urllib.parse.quote_plus(f"https://www.hcp.ma/plugin/?q={encoded}#gsc.tab=0&gsc.q={encoded}&gsc.page=1")
-            api_url = (
-                f"https://cse.google.com/cse/element/v1?rsz=filtered_cse&num=10&hl=fr&source=gcsc"
-                f"&cselibv={version.group(1)}&cx={self.CX}&q={encoded}&safe=off"
-                f"&cse_tok={urllib.parse.quote_plus(token.group(1))}&callback=google.search.cse.api"
-                f"&rurl={rurl}"
-            )
-            resp = self.session.get(api_url, timeout=10)
-            if resp.status_code != 200:
-                return None
+            except requests.exceptions.Timeout:
+                print(f"    ⏱️  Timeout réseau (tentative {attempt}/{self.MAX_RETRIES}).")
+                time.sleep(self.BASE_DELAY * attempt)
+            except Exception as e:
+                print(f"    [!] Exception inattendue: {e} (tentative {attempt}/{self.MAX_RETRIES}).")
+                time.sleep(self.BASE_DELAY * attempt)
 
-            match = re.search(r"google\.search\.cse\.api\((.*)\);?", resp.text, re.DOTALL)
-            if not match:
-                return None
-
-            results = json.loads(match.group(1)).get("results", [])
-            for r in results:
-                text = r.get("titleNoFormatting", "").lower() + " " + r.get("unescapedUrl", "").lower() + " " + r.get("contentNoFormatting", "").lower()
-                url = r.get("unescapedUrl", "")
-                if "prix" in text and "consommation" in text and str(year) in text and (mois_propre.lower() in text or mois_sans_accent in text):
-                    if self._is_valid_url(url):
-                        return url
-        except Exception as e:
-            print(f"    [!] Exception: {e}")
+        print(f"    ❌ Échec après {self.MAX_RETRIES} tentatives.")
         return None
 
     def run(self):
@@ -138,7 +175,7 @@ class HCPScraper:
                 print(f"    ✅ Trouvé : {url}")
             else:
                 print(f"    ⚠️  Non trouvé, conservé comme 'nan'.")
-            time.sleep(1)
 
-        self._save(data)
-        print(f"  💾 Sauvegardé dans {self.output_csv}")
+            # Sauvegarde après chaque mois → reprise possible après Ctrl+C
+            self._save(data)
+            time.sleep(self.BASE_DELAY)
