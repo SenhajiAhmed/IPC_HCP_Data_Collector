@@ -25,8 +25,8 @@ Ces scripts forment le flux de travail actif pour obtenir vos données finales. 
 - **Correction magique des formats :** Le site du HCP possède de nombreux anciens fichiers Word (`.doc`, `.docx` ou `.rtf`) masqués sous une fausse extension `.pdf`. Ce script analyse les premiers octets (le *magic number*) de chaque fichier téléchargé à la volée et lui attribue **la vraie extension correcte** (`.pdf`, `.docx`, `.doc` ou `.rtf`) pour éviter tout fichier corrompu.
 
 ### 4. `extract.py`
-**Rôle :** Extraire les tableaux de données depuis les fichiers téléchargés.
-**Fonctionnement :** Utilise les librairies `pdfplumber` et `pandas` pour parcourir les documents téléchargés dans `downloads/`. Le script identifie visuellement et extrait les tableaux contenant les chiffres de l'IPC, résout les problèmes de concaténation de colonnes, et fusionne l'ensemble des données dans un fichier Excel exploitable.
+**Rôle :** Extraire les tableaux de données depuis tous les types de fichiers téléchargés.
+**Fonctionnement :** Ce script traite les fichiers **PDF, DOC, DOCX et RTF**. Il utilise `pdfplumber` pour les PDF et `python-docx` pour les documents Word (après conversion automatique via LibreOffice si nécessaire). Il identifie les tableaux, les nettoie, et les sauvegarde sous forme de fichiers CSV organisés par année dans le dossier `extracted_tables/`.
 
 ---
 

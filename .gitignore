@@ -3,6 +3,7 @@ __pycache__/
 .env
 extracted_responses/
 downloads/
+extracted_tables/
 *.pdf
 *.docx
 *.doc
